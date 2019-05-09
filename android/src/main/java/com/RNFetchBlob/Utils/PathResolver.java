@@ -8,12 +8,16 @@ import android.os.Build;
 import android.provider.DocumentsContract;
 import android.provider.MediaStore;
 import android.content.ContentUris;
+import android.widget.Toast;
+import android.os.storage.StorageManager;
 import android.os.Environment;
 import android.content.ContentResolver;
 import com.RNFetchBlob.RNFetchBlobUtils;
 import java.io.File;
 import java.io.InputStream;
 import java.io.FileOutputStream;
+import java.lang.reflect.Array;
+import java.lang.reflect.Method;
 
 public class PathResolver {
     @TargetApi(19)
@@ -31,6 +35,48 @@ public class PathResolver {
 
                 if ("primary".equalsIgnoreCase(type)) {
                     return Environment.getExternalStorageDirectory() + "/" + split[1];
+                } else {
+                    // Below logic is how External Storage provider build URI for documents
+                    // Based on http://stackoverflow.com/questions/28605278/android-5-sd-card-label and https://gist.github.com/prasad321/9852037
+                    StorageManager mStorageManager = (StorageManager) context.getSystemService(Context.STORAGE_SERVICE);
+
+                    try {
+                        Class<?> storageVolumeClazz = Class.forName("android.os.storage.StorageVolume");
+                        Method getVolumeList = mStorageManager.getClass().getMethod("getVolumeList");
+                        Method getUuid = storageVolumeClazz.getMethod("getUuid");
+                        Method getState = storageVolumeClazz.getMethod("getState");
+                        Method getPath = storageVolumeClazz.getMethod("getPath");
+                        Method isPrimary = storageVolumeClazz.getMethod("isPrimary");
+                        Method isEmulated = storageVolumeClazz.getMethod("isEmulated");
+
+                        Object result = getVolumeList.invoke(mStorageManager);
+
+                        final int length = Array.getLength(result);
+                        for (int i = 0; i < length; i++) {
+                            Object storageVolumeElement = Array.get(result, i);
+                            //String uuid = (String) getUuid.invoke(storageVolumeElement);
+
+                            final boolean mounted = Environment.MEDIA_MOUNTED.equals(getState.invoke(storageVolumeElement))
+                                    || Environment.MEDIA_MOUNTED_READ_ONLY.equals(getState.invoke(storageVolumeElement));
+
+                            //if the media is not mounted, we need not get the volume details
+                            if (!mounted) continue;
+
+                            //Primary storage is already handled.
+                            if ((Boolean)isPrimary.invoke(storageVolumeElement) && (Boolean)isEmulated.invoke(storageVolumeElement)) continue;
+
+                            String uuid = (String) getUuid.invoke(storageVolumeElement);
+
+                            if (uuid != null && uuid.equals(type))
+                            {
+                                String res =getPath.invoke(storageVolumeElement) + "/" +split[1];
+                                return res;
+                            }
+                        }
+                    }
+                    catch (Exception ex) {
+                        Toast.makeText(context, ex.getMessage(), Toast.LENGTH_SHORT).show();
+                    }
                 }
 
                 // TODO handle non-primary volumes
@@ -72,30 +118,14 @@ public class PathResolver {
                 if (isGooglePhotosUri(uri))
                     return uri.getLastPathSegment();
 
+                else if (isGoogleDriveUri(uri))
+                    return getFileNameFromOtherProviders(context, uri);
+
                 return getDataColumn(context, uri, null, null);
             }
             // Other Providers
             else{
-                try {
-                    InputStream attachment = context.getContentResolver().openInputStream(uri);
-                    if (attachment != null) {
-                        String filename = getContentName(context.getContentResolver(), uri);
-                        if (filename != null) {
-                            File file = new File(context.getCacheDir(), filename);
-                            FileOutputStream tmp = new FileOutputStream(file);
-                            byte[] buffer = new byte[1024];
-                            while (attachment.read(buffer) > 0) {
-                                tmp.write(buffer);
-                            }
-                            tmp.close();
-                            attachment.close();
-                            return file.getAbsolutePath();
-                        }
-                    }
-                } catch (Exception e) {
-                    RNFetchBlobUtils.emitWarningEvent(e.toString());
-                    return null;
-                }
+                return getFileNameFromOtherProviders(context, uri);
             }
         }
         // MediaStore (and general)
@@ -104,6 +134,9 @@ public class PathResolver {
             // Return the remote address
             if (isGooglePhotosUri(uri))
                 return uri.getLastPathSegment();
+
+            else if (isGoogleDriveUri(uri))
+                return getFileNameFromOtherProviders(context, uri);
 
             return getDataColumn(context, uri, null, null);
         }
@@ -166,6 +199,36 @@ public class PathResolver {
         return result;
     }
 
+    /**
+     * This is need for google drive
+     *
+     * @param context The context.
+     * @param uri The Uri to query.
+     */
+    public static String getFileNameFromOtherProviders(Context context, Uri uri) {
+        String result = null;
+        try {
+            InputStream attachment = context.getContentResolver().openInputStream(uri);
+            if (attachment != null) {
+                String filename = getContentName(context.getContentResolver(), uri);
+                if (filename != null) {
+                    File file = new File(context.getCacheDir(), filename);
+                    FileOutputStream tmp = new FileOutputStream(file);
+                    byte[] buffer = new byte[1024];
+                    while (attachment.read(buffer) > 0) {
+                        tmp.write(buffer);
+                    }
+                    tmp.close();
+                    attachment.close();
+                    result = file.getAbsolutePath();
+                }
+            }
+        } catch (Exception e) {
+            RNFetchBlobUtils.emitWarningEvent(e.toString());
+            return null;
+        }
+        return result;
+    }
 
     /**
      * @param uri The Uri to check.
@@ -197,6 +260,14 @@ public class PathResolver {
      */
     public static boolean isGooglePhotosUri(Uri uri) {
         return "com.google.android.apps.photos.content".equals(uri.getAuthority());
+    }
+
+    /**
+     * @param uri The Uri to check.
+     * @return Whether the Uri authority is Google Docs.
+     */
+    public static boolean isGoogleDriveUri(Uri uri) {
+        return "com.google.android.apps.docs.storage".equals(uri.getAuthority());
     }
 
 }
